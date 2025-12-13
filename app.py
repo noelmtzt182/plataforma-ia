@@ -10,47 +10,57 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
 
 # ----------------------------
-# Config
+# Config Streamlit
 # ----------------------------
-st.set_page_config(
-    page_title="Plataforma IA | Desarrollo de Producto",
-    layout="wide"
-)
+st.set_page_config(page_title="IA Cereales | Éxito + Conexión", layout="wide")
 
-DATA_PATH_DEFAULT = "mercado_avanzado_emocional.csv"
+DATA_PATH_DEFAULT = "mercado_cereales_5000.csv"  # <-- CSV de cereales
 
 # ----------------------------
-# Carga de datos
+# Cargar datos
 # ----------------------------
 @st.cache_data
 def load_data(path_or_file) -> pd.DataFrame:
-    df = pd.read_csv(path_or_file)
-    # Limpieza mínima defensiva
-    df = df.copy()
-    # normalizar strings
-    for c in ["tipo_producto", "canal", "estacionalidad"]:
+    df = pd.read_csv(path_or_file).copy()
+
+    # Limpieza defensiva
+    for c in ["marca", "categoria", "canal", "estacionalidad"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip().str.lower()
-    return df
 
-# ----------------------------
-# Entrenamiento del modelo
-# ----------------------------
-@st.cache_resource
-def train_model(df: pd.DataFrame):
-    required_cols = [
-        "precio","competencia","demanda","tendencia","margen_pct",
-        "conexion_score","rating_conexion","sentiment_score",
-        "tipo_producto","canal","exito"
-    ]
-    missing = [c for c in required_cols if c not in df.columns]
+    # Validar columnas mínimas esperadas (para tu dataset de cereales)
+    required = {
+        "marca","canal","precio","costo","margen","margen_pct",
+        "competencia","demanda","tendencia","estacionalidad",
+        "rating_conexion","comentario","sentiment_score",
+        "conexion_score","conexion_alta","score_latente","exito"
+    }
+    missing = sorted(list(required - set(df.columns)))
     if missing:
         raise ValueError(f"Faltan columnas en el CSV: {missing}")
 
+    # Asegurar tipos numéricos clave
+    num_cols = ["precio","costo","margen","margen_pct","competencia","demanda","tendencia",
+                "rating_conexion","sentiment_score","conexion_score","conexion_alta","score_latente","exito"]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["marca","canal","precio","competencia","demanda","tendencia","margen_pct","conexion_score","rating_conexion","sentiment_score","exito"])
+    df["exito"] = df["exito"].astype(int)
+
+    return df
+
+# ----------------------------
+# Entrenar modelo
+# ----------------------------
+@st.cache_resource
+def train_model(df: pd.DataFrame):
+    # Features: negocio + emoción + categóricas (marca, canal)
     features = [
         "precio","competencia","demanda","tendencia","margen_pct",
         "conexion_score","rating_conexion","sentiment_score",
-        "tipo_producto","canal"
+        "marca","canal"
     ]
     X = df[features]
     y = df["exito"].astype(int)
@@ -59,7 +69,7 @@ def train_model(df: pd.DataFrame):
         "precio","competencia","demanda","tendencia","margen_pct",
         "conexion_score","rating_conexion","sentiment_score"
     ]
-    cat_cols = ["tipo_producto","canal"]
+    cat_cols = ["marca", "canal"]
 
     pre = ColumnTransformer(
         transformers=[
@@ -69,7 +79,7 @@ def train_model(df: pd.DataFrame):
     )
 
     model = RandomForestClassifier(
-        n_estimators=300,
+        n_estimators=350,
         random_state=42,
         class_weight="balanced_subsample"
     )
@@ -89,32 +99,19 @@ def train_model(df: pd.DataFrame):
     auc = roc_auc_score(y_test, proba)
     cm = confusion_matrix(y_test, pred)
 
-    return clf, acc, auc, cm, df
-
-# ----------------------------
-# Utilidades
-# ----------------------------
-def safe_float(x, default=0.0):
-    try:
-        return float(x)
-    except Exception:
-        return default
+    return clf, acc, auc, cm
 
 def clip(v, a, b):
     return max(a, min(b, v))
 
 # ----------------------------
-# UI - Sidebar
+# Sidebar: carga de CSV
 # ----------------------------
 st.sidebar.title("⚙️ Configuración")
-
-uploaded = st.sidebar.file_uploader(
-    "Sube tu CSV (mercado_avanzado_emocional.csv)",
-    type=["csv"]
-)
+uploaded = st.sidebar.file_uploader("Sube tu CSV (mercado_cereales_5000.csv)", type=["csv"])
 
 use_default = st.sidebar.checkbox(
-    "Usar archivo local (mercado_avanzado_emocional.csv)",
+    "Usar archivo local (mercado_cereales_5000.csv)",
     value=(uploaded is None)
 )
 
@@ -127,10 +124,10 @@ else:
         st.stop()
 
 # ----------------------------
-# Entrenar modelo
+# Entrenar
 # ----------------------------
 try:
-    clf, acc, auc, cm, df = train_model(df)
+    clf, acc, auc, cm = train_model(df)
 except Exception as e:
     st.error(f"Error entrenando el modelo: {e}")
     st.stop()
@@ -138,21 +135,17 @@ except Exception as e:
 # ----------------------------
 # Header
 # ----------------------------
-st.title("🚀 Plataforma IA para Desarrollo de Producto (con Conexión Emocional)")
-st.caption("Predicción de éxito + conexión emocional + simulación what-if + insights por tipo/canal")
+st.title("🥣 IA para Cereales | Éxito + Conexión Emocional")
+st.caption("Predicción de éxito por marca/canal + simulación what-if + insights (retail vs marketplace)")
 
-# KPIs
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Registros", f"{len(df):,}")
 k2.metric("Precisión (test)", f"{acc*100:.2f}%")
 k3.metric("AUC (test)", f"{auc:.3f}")
-k4.metric("Éxito (base)", f"{(df['exito'].mean()*100):.1f}%")
+k4.metric("Éxito (base)", f"{df['exito'].mean()*100:.1f}%")
 
 st.divider()
 
-# ----------------------------
-# Tabs
-# ----------------------------
 tab_sim, tab_ins, tab_data, tab_model = st.tabs(
     ["🧪 Simulador", "📊 Insights", "📂 Datos", "🧠 Modelo"]
 )
@@ -161,22 +154,17 @@ tab_sim, tab_ins, tab_data, tab_model = st.tabs(
 # TAB: Simulador
 # ============================================================
 with tab_sim:
-    st.subheader("🧪 Simulador What-If (Producto / Digital / Servicio)")
-    st.write("Ajusta variables y predice **probabilidad de éxito**. También puedes estimar la **conexión emocional**.")
+    st.subheader("🧪 Simulador What-If (Cereales)")
+    st.write("Simula un escenario por **marca** y **canal** para obtener **probabilidad de éxito** y **conexión emocional**.")
 
-    # Opciones desde el dataset (para evitar valores que el modelo no conozca)
-    tipos = sorted(df["tipo_producto"].dropna().unique().tolist())
+    marcas = sorted(df["marca"].dropna().unique().tolist())
     canales = sorted(df["canal"].dropna().unique().tolist())
+    estacionalidades = sorted(df["estacionalidad"].dropna().unique().tolist())
 
     c1, c2, c3 = st.columns(3)
-    tipo_producto = c1.selectbox("Tipo de producto", tipos, index=0)
+    marca = c1.selectbox("Marca", marcas, index=0)
     canal = c2.selectbox("Canal", canales, index=0)
-    estacionalidad = c3.selectbox(
-        "Estacionalidad (solo informativa)",
-        sorted(df["estacionalidad"].dropna().unique().tolist())
-        if "estacionalidad" in df.columns else ["media"],
-        index=0
-    )
+    estacionalidad = c3.selectbox("Estacionalidad (informativa)", estacionalidades, index=0)
 
     st.markdown("### Variables de negocio")
     b1, b2, b3, b4, b5 = st.columns(5)
@@ -189,16 +177,13 @@ with tab_sim:
     st.markdown("### Variables emocionales")
     e1, e2 = st.columns([1, 2])
     rating_conexion = e1.slider("Rating conexión (1-10)", 1, 10, int(np.clip(df["rating_conexion"].median(), 1, 10)))
-    comentario = e2.text_input(
-        "Comentario (opcional)",
-        value="Me encanta este producto, lo volvería a elegir"
-    )
+    comentario = e2.text_input("Comentario (opcional)", value="Me encanta el sabor y la textura")
 
-    # Sentimiento (simple, mismo enfoque que dataset)
-    pos_words = ["encanta", "muy bien", "positiva", "volvería", "identifico", "me identifico"]
-    neg_words = ["no conecté", "no me convence", "no lo volvería", "no fue", "no me sentí", "no me convenció"]
+    # Sentimiento simple: -1, 0, 1 (coherente con el dataset)
+    pos_words = ["encanta", "me gusta", "buena calidad", "me identifico", "excelente", "premium"]
+    neg_words = ["no me gustó", "no me convence", "caro", "no conecté", "no lo volvería", "malo"]
 
-    def sentimiento_simple(text: str) -> float:
+    def sentimiento_simple(text: str) -> int:
         t = (text or "").lower()
         score = 0
         for w in pos_words:
@@ -207,26 +192,27 @@ with tab_sim:
         for w in neg_words:
             if w in t:
                 score -= 1
-        return float(clip(score / 2, -1, 1))
+        if score > 0:
+            return 1
+        if score < 0:
+            return -1
+        return 0
 
-    sent_score = sentimiento_simple(comentario)
+    sentiment_score = sentimiento_simple(comentario)
 
-    # conexion_score (0-100) compatible con tu dataset
-    bonus_tipo = {"fisico": 5, "digital": 3, "servicio": 7}.get(tipo_producto, 0)
-    rating_norm = (rating_conexion / 10) * 70
-    sentiment_points = sent_score * 15
-    conexion_score = clip(round(rating_norm + sentiment_points + bonus_tipo, 2), 0, 100)
+    # Conexión emocional (0-100) — cereal físico: bonus 5
+    conexion_score = clip(round((rating_conexion / 10) * 70 + sentiment_score * 15 + 5, 2), 0, 100)
 
     entrada = pd.DataFrame([{
-        "precio": safe_float(precio),
-        "competencia": safe_float(competencia),
-        "demanda": safe_float(demanda),
-        "tendencia": safe_float(tendencia),
-        "margen_pct": safe_float(margen_pct),
-        "conexion_score": safe_float(conexion_score),
-        "rating_conexion": safe_float(rating_conexion),
-        "sentiment_score": safe_float(sent_score),
-        "tipo_producto": tipo_producto,
+        "precio": float(precio),
+        "competencia": float(competencia),
+        "demanda": float(demanda),
+        "tendencia": float(tendencia),
+        "margen_pct": float(margen_pct),
+        "conexion_score": float(conexion_score),
+        "rating_conexion": float(rating_conexion),
+        "sentiment_score": float(sentiment_score),
+        "marca": marca,
         "canal": canal
     }])
 
@@ -239,8 +225,7 @@ with tab_sim:
         r2.metric("Predicción", "✅ Éxito" if pred == 1 else "⚠️ Riesgo")
         r3.metric("Conexión emocional", f"{conexion_score:.1f} / 100")
 
-        st.caption(f"Sentimiento estimado: {sent_score:+.2f}  |  Estacionalidad (informativa): {estacionalidad}")
-
+        st.caption(f"Sentimiento: {sentiment_score:+d}  |  Estacionalidad (informativa): {estacionalidad}")
         st.markdown("#### Entrada usada por el modelo")
         st.dataframe(entrada, use_container_width=True)
 
@@ -248,29 +233,49 @@ with tab_sim:
 # TAB: Insights
 # ============================================================
 with tab_ins:
-    st.subheader("📊 Insights (Conexión y Éxito)")
+    st.subheader("📊 Insights (Marca, Canal, Conexión, Éxito)")
 
-    a1, a2 = st.columns(2)
+    left, right = st.columns(2)
 
-    with a1:
-        st.markdown("**Conexión promedio por tipo de producto**")
-        ins_tipo = df.groupby("tipo_producto")[["conexion_score"]].mean().sort_values("conexion_score", ascending=False).round(2)
-        st.dataframe(ins_tipo, use_container_width=True)
+    with left:
+        st.markdown("**Ranking por marca (Conexión promedio)**")
+        ins_marca = (
+            df.groupby("marca")[["conexion_score"]]
+            .mean()
+            .sort_values("conexion_score", ascending=False)
+            .round(2)
+        )
+        st.dataframe(ins_marca, use_container_width=True)
 
-        st.markdown("**Éxito promedio por tipo de producto**")
-        ex_tipo = df.groupby("tipo_producto")[["exito"]].mean().sort_values("exito", ascending=False).round(3)
-        ex_tipo["exito_%"] = (ex_tipo["exito"] * 100).round(1)
-        st.dataframe(ex_tipo[["exito_%"]], use_container_width=True)
+        st.markdown("**Ranking por marca (Éxito %)**")
+        ex_marca = (
+            df.groupby("marca")[["exito"]]
+            .mean()
+            .sort_values("exito", ascending=False)
+            .round(3)
+        )
+        ex_marca["exito_%"] = (ex_marca["exito"] * 100).round(1)
+        st.dataframe(ex_marca[["exito_%"]], use_container_width=True)
 
-    with a2:
-        st.markdown("**Conexión promedio por tipo + canal**")
-        ins_tc = df.groupby(["tipo_producto", "canal"])[["conexion_score"]].mean().sort_values("conexion_score", ascending=False).round(2)
-        st.dataframe(ins_tc.head(15), use_container_width=True)
+    with right:
+        st.markdown("**Marca + Canal (Conexión promedio)**")
+        ins_mc = (
+            df.groupby(["marca", "canal"])[["conexion_score"]]
+            .mean()
+            .sort_values("conexion_score", ascending=False)
+            .round(2)
+        )
+        st.dataframe(ins_mc.head(20), use_container_width=True)
 
-        st.markdown("**Éxito por tipo + canal**")
-        ex_tc = df.groupby(["tipo_producto", "canal"])[["exito"]].mean().sort_values("exito", ascending=False).round(3)
-        ex_tc["exito_%"] = (ex_tc["exito"] * 100).round(1)
-        st.dataframe(ex_tc.head(15)[["exito_%"]], use_container_width=True)
+        st.markdown("**Marca + Canal (Éxito %)**")
+        ex_mc = (
+            df.groupby(["marca", "canal"])[["exito"]]
+            .mean()
+            .sort_values("exito", ascending=False)
+            .round(3)
+        )
+        ex_mc["exito_%"] = (ex_mc["exito"] * 100).round(1)
+        st.dataframe(ex_mc.head(20)[["exito_%"]], use_container_width=True)
 
     st.divider()
     st.markdown("### Distribuciones")
@@ -280,23 +285,22 @@ with tab_ins:
         st.bar_chart(df["conexion_score"].value_counts().sort_index())
     with d2:
         st.markdown("**Histograma: Precio**")
-        st.bar_chart(df["precio"].round().value_counts().sort_index().head(60))
+        st.bar_chart(df["precio"].round().value_counts().sort_index().head(80))
 
 # ============================================================
 # TAB: Datos
 # ============================================================
 with tab_data:
-    st.subheader("📂 Dataset")
-    st.write("Filtro rápido para explorar el dataset en la app.")
+    st.subheader("📂 Explorador del dataset")
 
     f1, f2, f3 = st.columns(3)
-    ftipo = f1.multiselect("Filtrar tipo_producto", sorted(df["tipo_producto"].unique().tolist()), default=[])
+    fmarca = f1.multiselect("Filtrar marca", sorted(df["marca"].unique().tolist()), default=[])
     fcanal = f2.multiselect("Filtrar canal", sorted(df["canal"].unique().tolist()), default=[])
     fex = f3.selectbox("Filtrar éxito", ["Todos", "Éxito (1)", "No éxito (0)"], index=0)
 
     dff = df.copy()
-    if ftipo:
-        dff = dff[dff["tipo_producto"].isin(ftipo)]
+    if fmarca:
+        dff = dff[dff["marca"].isin(fmarca)]
     if fcanal:
         dff = dff[dff["canal"].isin(fcanal)]
     if fex == "Éxito (1)":
@@ -318,20 +322,19 @@ with tab_model:
     st.dataframe(cm_df, use_container_width=True)
 
     st.markdown("**Importancias de features (aprox.)**")
-    # Recuperar importancias del RandomForest dentro del Pipeline
     try:
         rf = clf.named_steps["model"]
         pre = clf.named_steps["preprocessor"]
 
-        # Nombres de features después del OneHot
         ohe = pre.named_transformers_["cat"]
-        cat_features = ohe.get_feature_names_out(["tipo_producto", "canal"]).tolist()
+        cat_features = ohe.get_feature_names_out(["marca", "canal"]).tolist()
+
         feature_names = [
             "precio","competencia","demanda","tendencia","margen_pct",
             "conexion_score","rating_conexion","sentiment_score"
         ] + cat_features
 
         importances = pd.Series(rf.feature_importances_, index=feature_names).sort_values(ascending=False)
-        st.dataframe(importances.head(25).round(4), use_container_width=True)
+        st.dataframe(importances.head(30).round(4), use_container_width=True)
     except Exception:
         st.info("No se pudieron mostrar importancias (depende de versión de scikit-learn).")
