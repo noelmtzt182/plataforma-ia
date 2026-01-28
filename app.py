@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+from pathlib import Path
+from PIL import Image
 
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
@@ -10,41 +12,212 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, mean_absolute_error
 
 # ----------------------------
-# Config Streamlit
+# Config
 # ----------------------------
-st.set_page_config(page_title="IA Cereales | Éxito + Conexión + Ventas", layout="wide")
-DATA_PATH_DEFAULT = "mercado_cereales_5000.csv"  # CSV de cereales en tu repo
+st.set_page_config(page_title="Plataforma IA | Producto + Empaque + Claims", layout="wide")
+DATA_PATH_DEFAULT = "mercado_cereales_5000_con_ventas.csv"
+
+REQUIRED_BASE = {
+    "marca","categoria","canal","precio","costo","margen","margen_pct",
+    "competencia","demanda","tendencia","estacionalidad",
+    "rating_conexion","comentario","sentiment_score",
+    "conexion_score","conexion_alta","score_latente","exito"
+}
+REQUIRED_SALES = {"ventas_unidades","ventas_ingresos","utilidad"}
 
 # ----------------------------
-# Utilidades
+# Helpers
 # ----------------------------
+def _clean_str_series(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.strip().str.lower()
+
 def clip(v, a, b):
-    return max(a, min(b, v))
+    return float(max(a, min(b, v)))
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+def safe_percent(x):
+    return f"{x*100:.2f}%"
 
 # ----------------------------
-# Cargar datos
+# Image metrics (sin OCR)
+# ----------------------------
+def image_metrics(img: Image.Image) -> dict:
+    """
+    Métricas simples (rápidas) para aproximar:
+    - brillo, contraste, colorfulness, edge_density (pop/claridad)
+    """
+    im = img.convert("RGB")
+    arr = np.asarray(im).astype(np.float32)
+
+    # brightness
+    gray = (0.299*arr[...,0] + 0.587*arr[...,1] + 0.114*arr[...,2])
+    brightness = float(np.mean(gray) / 255.0)
+
+    # contrast (std)
+    contrast = float(np.std(gray) / 255.0)
+
+    # colorfulness (Hasler & Süsstrunk approximation)
+    rg = arr[...,0] - arr[...,1]
+    yb = 0.5*(arr[...,0] + arr[...,1]) - arr[...,2]
+    colorfulness = float((np.std(rg) + 0.3*np.std(yb)) / 255.0)
+
+    # edge density: sobel magnitude threshold
+    # (simple approximation)
+    gx = np.zeros_like(gray)
+    gy = np.zeros_like(gray)
+    gx[:,1:-1] = gray[:,2:] - gray[:,:-2]
+    gy[1:-1,:] = gray[2:,:] - gray[:-2,:]
+    mag = np.sqrt(gx**2 + gy**2)
+    thresh = np.percentile(mag, 85)
+    edges = (mag > thresh).astype(np.float32)
+    edge_density = float(np.mean(edges))
+
+    # "pop" proxy: balance contrast + colorfulness
+    pop_score = clip(0.55*contrast + 0.45*colorfulness, 0, 1)
+
+    return {
+        "brightness": brightness,
+        "contrast": contrast,
+        "colorfulness": colorfulness,
+        "edge_density": edge_density,
+        "pop_score": pop_score
+    }
+
+def pack_scores_from_metrics(m: dict) -> dict:
+    """
+    Convierte métricas en scores 0-100 (interpretables).
+    """
+    # Legibilidad proxy: contraste alto y edge_density moderada (demasiados bordes = ruido)
+    legibility = 70*m["contrast"] + 30*(1 - abs(m["edge_density"] - 0.18)/0.18)
+    legibility = clip(legibility, 0, 1) * 100
+
+    # Shelf pop proxy: pop_score + brillo medio (ni muy oscuro ni quemado)
+    target_brightness = 0.55
+    brightness_fit = 1 - abs(m["brightness"] - target_brightness)/target_brightness
+    shelf_pop = clip(0.75*m["pop_score"] + 0.25*clip(brightness_fit, 0, 1), 0, 1) * 100
+
+    # Clarity proxy: edge_density baja/moderada + contraste medio/alto
+    clarity = clip(0.6*m["contrast"] + 0.4*(1 - clip(m["edge_density"]/0.35, 0, 1)), 0, 1) * 100
+
+    return {
+        "pack_legibility_score": round(legibility, 1),
+        "pack_shelf_pop_score": round(shelf_pop, 1),
+        "pack_clarity_score": round(clarity, 1),
+    }
+
+# ----------------------------
+# Claims engine (reglas + scoring)
+# ----------------------------
+CLAIMS_LIBRARY = {
+    "fit": [
+        ("Alto en proteína", 0.90),
+        ("Sin azúcar añadida", 0.88),
+        ("Alto en fibra", 0.86),
+        ("Integral", 0.80),
+        ("Bajo en calorías", 0.78),
+        ("Sin colorantes artificiales", 0.72)
+    ],
+    "kids": [
+        ("Con vitaminas y minerales", 0.86),
+        ("Sabor chocolate", 0.82),
+        ("Energía para su día", 0.78),
+        ("Hecho con granos", 0.74),
+        ("Sin conservadores", 0.70)
+    ],
+    "premium": [
+        ("Ingredientes seleccionados", 0.82),
+        ("Sabor intenso", 0.78),
+        ("Hecho con avena real", 0.76),
+        ("Calidad premium", 0.70),
+        ("Receta artesanal", 0.64)
+    ],
+    "value": [
+        ("Rinde más", 0.78),
+        ("Gran sabor a mejor precio", 0.74),
+        ("Ideal para la familia", 0.72),
+        ("Económico y práctico", 0.66)
+    ]
+}
+
+CANAL_CLAIM_BOOST = {
+    "retail": {"Sin azúcar añadida": 1.04, "Alto en fibra": 1.03, "Integral": 1.02},
+    "marketplace": {"Alto en proteína": 1.05, "Sin colorantes artificiales": 1.04, "Ingredientes seleccionados": 1.03}
+}
+
+def recommend_claims(segment: str, canal: str, max_claims: int = 5):
+    seg = segment.lower().strip()
+    canal = canal.lower().strip()
+    items = CLAIMS_LIBRARY.get(seg, [])[:]
+    scored = []
+    for claim, base in items:
+        boost = CANAL_CLAIM_BOOST.get(canal, {}).get(claim, 1.0)
+        score = base * boost
+        scored.append((claim, score))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:max_claims]
+
+def claims_score(selected_claims, canal: str) -> float:
+    """
+    Score 0-100 basado en:
+    - base scores del segmento (aprox)
+    - boosts por canal
+    - penalización por saturación (más de 3 claims baja claridad)
+    """
+    if not selected_claims:
+        return 0.0
+    canal = canal.lower().strip()
+
+    # base = promedio de boosts (si no existe claim en boost, =1)
+    boosts = []
+    for c in selected_claims:
+        boosts.append(CANAL_CLAIM_BOOST.get(canal, {}).get(c, 1.0))
+    base = np.mean(boosts)
+
+    # claridad: penaliza demasiados claims
+    n = len(selected_claims)
+    clarity_penalty = 1.0 if n <= 3 else max(0.65, 1.0 - 0.12*(n-3))
+
+    score = 75 * base * clarity_penalty
+    return float(np.clip(score, 0, 100))
+
+# ----------------------------
+# Emoción del empaque
+# ----------------------------
+def pack_emotion_score(pack_legibility, pack_pop, pack_clarity, claims_score_val, copy_tone: int):
+    """
+    Score 0-100:
+    - Pop + claridad + claims (impactan intención)
+    - tono del copy: -1,0,1 (negativo, neutro, positivo)
+    """
+    # peso visual
+    visual = 0.40*(pack_pop/100) + 0.30*(pack_clarity/100) + 0.15*(pack_legibility/100)
+    # peso claims
+    claims = 0.15*(claims_score_val/100)
+
+    # tono
+    tone_boost = 0.06 if copy_tone > 0 else (-0.06 if copy_tone < 0 else 0.0)
+
+    score = (visual + claims + tone_boost) * 100
+    return float(np.clip(score, 0, 100))
+
+# ----------------------------
+# Data loading
 # ----------------------------
 @st.cache_data
 def load_data(path_or_file) -> pd.DataFrame:
     df = pd.read_csv(path_or_file).copy()
 
-    # Limpieza defensiva de strings
-    for c in ["marca", "categoria", "canal", "estacionalidad"]:
+    for c in ["marca","categoria","canal","estacionalidad","comentario"]:
         if c in df.columns:
-            df[c] = df[c].astype(str).str.strip().str.lower()
+            df[c] = _clean_str_series(df[c])
 
-    # Validar columnas mínimas esperadas (dataset cereales)
-    required = {
-        "marca","categoria","canal","precio","costo","margen","margen_pct",
-        "competencia","demanda","tendencia","estacionalidad",
-        "rating_conexion","comentario","sentiment_score",
-        "conexion_score","conexion_alta","score_latente","exito"
-    }
-    missing = sorted(list(required - set(df.columns)))
+    missing = sorted(list(REQUIRED_BASE - set(df.columns)))
     if missing:
-        raise ValueError(f"Faltan columnas en el CSV: {missing}")
+        raise ValueError(f"Faltan columnas base en el CSV: {missing}")
 
-    # Asegurar tipos numéricos clave
+    # numeric
     num_cols = [
         "precio","costo","margen","margen_pct","competencia","demanda","tendencia",
         "rating_conexion","sentiment_score","conexion_score","conexion_alta",
@@ -53,59 +226,16 @@ def load_data(path_or_file) -> pd.DataFrame:
     for c in num_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df = df.dropna(subset=[
-        "marca","canal","precio","competencia","demanda","tendencia","margen_pct",
-        "conexion_score","rating_conexion","sentiment_score","exito"
-    ])
+    for c in ["ventas_unidades","ventas_ingresos","utilidad"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["marca","canal","precio","competencia","demanda","tendencia","margen_pct","conexion_score","rating_conexion","sentiment_score","exito"])
     df["exito"] = df["exito"].astype(int)
     return df
 
 # ----------------------------
-# Agregar columnas de venta (si no existen)
-# ----------------------------
-def add_sales_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    if "ventas_unidades" in df.columns and "ventas_ingresos" in df.columns and "utilidad" in df.columns:
-        # Ya existen; no recalcular
-        return df
-
-    # Factores por canal (ajusta a tu realidad)
-    canal_factor = df["canal"].map({
-        "retail": 1.00,
-        "marketplace": 0.85
-    }).fillna(1.0)
-
-    # Factor emocional: 50 neutral; arriba sube; abajo baja
-    emo_factor = (1 + (df["conexion_score"] - 50) / 120).clip(0.6, 1.5)
-
-    # Factor marca (ejemplo; puedes calibrarlo con datos reales)
-    marca_factor_map = {
-        "goldengrain": 1.08, "fitmorning": 1.06, "fiberplus": 1.05, "vitalmix": 1.04,
-        "kidsstar": 1.03, "chocoboom": 1.02,
-        "cerealnova": 1.00, "crunchmax": 0.99, "honeyoats": 0.98, "corncrisp": 0.97
-    }
-    marca_factor = df["marca"].map(marca_factor_map).fillna(1.0)
-
-    # Base de ventas (proxy): demanda * escala
-    # Escala: 120 unidades por punto de demanda (mensual). Ajusta si quieres.
-    base = df["demanda"] * 120
-
-    # Ruido realista
-    rng = np.random.default_rng(2026)
-    ruido = rng.normal(0, 180, len(df))
-
-    # Ventas mensuales estimadas (unidades)
-    df["ventas_unidades"] = (base * canal_factor * emo_factor * marca_factor + ruido).clip(0).round(0).astype(int)
-
-    # Ingresos y utilidad
-    df["ventas_ingresos"] = (df["ventas_unidades"] * df["precio"]).round(2)
-    df["utilidad"] = (df["ventas_unidades"] * df["margen"]).round(2)
-
-    return df
-
-# ----------------------------
-# Entrenar modelo de ÉXITO (clasificación)
+# Models
 # ----------------------------
 @st.cache_resource
 def train_success_model(df: pd.DataFrame):
@@ -121,7 +251,7 @@ def train_success_model(df: pd.DataFrame):
         "precio","competencia","demanda","tendencia","margen_pct",
         "conexion_score","rating_conexion","sentiment_score"
     ]
-    cat_cols = ["marca", "canal"]
+    cat_cols = ["marca","canal"]
 
     pre = ColumnTransformer(
         transformers=[
@@ -130,36 +260,26 @@ def train_success_model(df: pd.DataFrame):
         ]
     )
 
-    clf_model = RandomForestClassifier(
-        n_estimators=350,
-        random_state=42,
-        class_weight="balanced_subsample"
-    )
+    clf = Pipeline(steps=[
+        ("preprocessor", pre),
+        ("model", RandomForestClassifier(n_estimators=350, random_state=42, class_weight="balanced_subsample"))
+    ])
 
-    clf = Pipeline(steps=[("preprocessor", pre), ("model", clf_model)])
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     clf.fit(X_train, y_train)
 
     pred = clf.predict(X_test)
     proba = clf.predict_proba(X_test)[:, 1]
-
     acc = accuracy_score(y_test, pred)
     auc = roc_auc_score(y_test, proba)
     cm = confusion_matrix(y_test, pred)
-
     return clf, acc, auc, cm
 
-# ----------------------------
-# Entrenar modelo de VENTAS (regresión)
-# ----------------------------
 @st.cache_resource
 def train_sales_model(df: pd.DataFrame):
-    if "ventas_unidades" not in df.columns:
-        raise ValueError("No existe 'ventas_unidades' en el dataset. Asegúrate de ejecutar add_sales_columns(df).")
+    missing_sales = sorted(list(REQUIRED_SALES - set(df.columns)))
+    if missing_sales:
+        raise ValueError(f"Este CSV no trae ventas. Faltan: {missing_sales}. Usa mercado_cereales_5000_con_ventas.csv")
 
     features = [
         "precio","competencia","demanda","tendencia","margen_pct",
@@ -173,7 +293,7 @@ def train_sales_model(df: pd.DataFrame):
         "precio","competencia","demanda","tendencia","margen_pct",
         "conexion_score","rating_conexion","sentiment_score"
     ]
-    cat_cols = ["marca", "canal"]
+    cat_cols = ["marca","canal"]
 
     pre = ColumnTransformer(
         transformers=[
@@ -182,48 +302,34 @@ def train_sales_model(df: pd.DataFrame):
         ]
     )
 
-    reg_model = RandomForestRegressor(
-        n_estimators=350,
-        random_state=42
-    )
+    reg = Pipeline(steps=[
+        ("preprocessor", pre),
+        ("model", RandomForestRegressor(n_estimators=350, random_state=42))
+    ])
 
-    reg = Pipeline(steps=[("preprocessor", pre), ("model", reg_model)])
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     reg.fit(X_train, y_train)
 
     pred = reg.predict(X_test)
     mae = mean_absolute_error(y_test, pred)
-
     return reg, mae
 
 # ----------------------------
-# Sidebar
+# Sidebar: load CSV robust
 # ----------------------------
-st.sidebar.title("⚙️ Configuración")
-uploaded = st.sidebar.file_uploader("Sube tu CSV (mercado_cereales_5000.csv)", type=["csv"])
+st.sidebar.title("⚙️ Datos")
+uploaded = st.sidebar.file_uploader("Sube tu CSV (con ventas)", type=["csv"])
 
-use_default = st.sidebar.checkbox(
-    "Usar archivo local del repo (mercado_cereales_5000.csv)",
-    value=(uploaded is None)
-)
-
-# Cargar DF
 if uploaded is not None:
     df = load_data(uploaded)
 else:
-    if use_default:
+    if Path(DATA_PATH_DEFAULT).exists():
         df = load_data(DATA_PATH_DEFAULT)
     else:
+        st.warning(f"❗No encontré '{DATA_PATH_DEFAULT}' en el repo. Sube el CSV para arrancar.")
         st.stop()
 
-# Agregar ventas
-df = add_sales_columns(df)
-
-# Entrenar modelos
+# Train models
 try:
     success_model, acc, auc, cm = train_success_model(df)
     sales_model, mae = train_sales_model(df)
@@ -234,37 +340,39 @@ except Exception as e:
 # ----------------------------
 # Header
 # ----------------------------
-st.title("🥣 Cereales | Éxito + Conexión Emocional + Ventas")
-st.caption("Predicción de éxito por marca/canal + simulación what-if + ventas estimadas + insights (retail vs marketplace)")
+st.title("🧠 Plataforma IA: Producto + Empaque + Claims")
+st.caption("Éxito + Ventas estimadas + Pack Lab + Claims Lab + Experimentos (A/B)")
 
 k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("Registros", f"{len(df):,}")
-k2.metric("Precisión (test)", f"{acc*100:.2f}%")
-k3.metric("AUC (test)", f"{auc:.3f}")
-k4.metric("Éxito (base)", f"{df['exito'].mean()*100:.1f}%")
+k2.metric("Precisión", f"{acc*100:.2f}%")
+k3.metric("AUC", f"{auc:.3f}")
+k4.metric("Éxito base", f"{df['exito'].mean()*100:.1f}%")
 k5.metric("MAE ventas", f"{mae:,.0f} u.")
 
 st.divider()
 
-tab_sim, tab_ins, tab_data, tab_model = st.tabs(
-    ["🧪 Simulador", "📊 Insights", "📂 Datos", "🧠 Modelo"]
+# ----------------------------
+# Tabs
+# ----------------------------
+tab_sim, tab_pack, tab_claims, tab_exp, tab_data, tab_model = st.tabs(
+    ["🧪 Simulador", "📦 Pack Lab", "🏷️ Claims Lab", "🧪 Experimentos", "📂 Datos", "🧠 Modelo"]
 )
 
 # ============================================================
-# TAB: Simulador
+# 🧪 Simulador (usa outputs de Pack+Claims como uplift)
 # ============================================================
 with tab_sim:
-    st.subheader("🧪 Simulador What-If (Marca + Canal + Ventas)")
-    st.write("Simula un escenario y obtiene **probabilidad de éxito**, **conexión emocional** y **ventas estimadas**.")
+    st.subheader("🧪 Simulador What-If (incluye empaque + claims)")
+    st.write("La lógica: **Pack Score + Claims Score** ajustan tu **conexión emocional** y por eso impactan éxito y ventas.")
 
-    marcas = sorted(df["marca"].dropna().unique().tolist())
-    canales = sorted(df["canal"].dropna().unique().tolist())
-    estacionalidades = sorted(df["estacionalidad"].dropna().unique().tolist())
+    marcas = sorted(df["marca"].unique().tolist())
+    canales = sorted(df["canal"].unique().tolist())
 
     c1, c2, c3 = st.columns(3)
-    marca = c1.selectbox("Marca", marcas, index=0)
-    canal = c2.selectbox("Canal", canales, index=0)
-    estacionalidad = c3.selectbox("Estacionalidad (informativa)", estacionalidades, index=0)
+    marca = c1.selectbox("Marca", marcas, 0)
+    canal = c2.selectbox("Canal", canales, 0)
+    segmento = c3.selectbox("Segmento objetivo", ["fit", "kids", "premium", "value"], 0)
 
     st.markdown("### Variables de negocio")
     b1, b2, b3, b4, b5 = st.columns(5)
@@ -274,37 +382,41 @@ with tab_sim:
     tendencia = b4.slider("Tendencia (20-100)", 20, 100, int(df["tendencia"].median()))
     margen_pct = b5.slider("Margen %", 0, 90, int(np.clip(df["margen_pct"].median(), 0, 90)))
 
-    st.markdown("### Variables emocionales")
-    e1, e2 = st.columns([1, 2])
-    rating_conexion = e1.slider("Rating conexión (1-10)", 1, 10, int(np.clip(df["rating_conexion"].median(), 1, 10)))
-    comentario = e2.text_input("Comentario (opcional)", value="Me encanta el sabor y la textura")
+    st.markdown("### Empaque + Claims (inputs)")
+    p1, p2, p3 = st.columns(3)
+    pack_legibility_score = p1.slider("Pack legibilidad (0-100)", 0, 100, 65)
+    pack_shelf_pop_score = p2.slider("Pack shelf pop (0-100)", 0, 100, 70)
+    pack_clarity_score = p3.slider("Pack claridad (0-100)", 0, 100, 65)
 
-    # Sentimiento simple: -1, 0, 1 (coherente con el dataset)
-    pos_words = ["encanta", "me gusta", "buena calidad", "me identifico", "excelente", "premium"]
-    neg_words = ["no me gustó", "no me convence", "caro", "no conecté", "no lo volvería", "malo"]
+    # claims (selección rápida)
+    recs = recommend_claims(segmento, canal, max_claims=6)
+    claim_options = [c for c,_ in recs]
+    selected_claims = st.multiselect("Selecciona claims (ideal 2-3)", claim_options, default=claim_options[:2])
 
-    def sentimiento_simple(text: str) -> int:
-        t = (text or "").lower()
-        score = 0
-        for w in pos_words:
-            if w in t:
-                score += 1
-        for w in neg_words:
-            if w in t:
-                score -= 1
-        if score > 0:
-            return 1
-        if score < 0:
-            return -1
-        return 0
+    # tono del copy (manual / rápido)
+    copy = st.text_input("Copy corto (opcional)", value="Energía y nutrición para tu día")
+    # tono simple (no NLP pesado)
+    pos_kw = ["energía","nutrición","saludable","delicioso","me encanta","premium","calidad","proteína","fibra"]
+    neg_kw = ["caro","no","malo","rechazo","no me gusta","pésimo","horrible"]
+    t = copy.lower()
+    tone = 0
+    if any(k in t for k in pos_kw): tone += 1
+    if any(k in t for k in neg_kw): tone -= 1
+    copy_tone = 1 if tone>0 else (-1 if tone<0 else 0)
 
-    sentiment_score = sentimiento_simple(comentario)
+    # Scores
+    cscore = claims_score(selected_claims, canal)
+    pack_emotion = pack_emotion_score(pack_legibility_score, pack_shelf_pop_score, pack_clarity_score, cscore, copy_tone)
 
-    # Conexión emocional (0-100) — cereal físico: bonus 5
-    conexion_score = clip(round((rating_conexion / 10) * 70 + sentiment_score * 15 + 5, 2), 0, 100)
+    # Ajuste de conexión: base (rating+sentiment) + uplift empaque/claims
+    # Uplift: empaque+claims pueden sumar hasta ~+18 puntos a conexión (controlado)
+    uplift = clip((pack_emotion - 50)/50, -0.35, 0.35)  # -35% a +35% relativo
+    base_rating = 6.5  # neutral
+    rating_conexion = st.slider("Rating conexión producto (1-10)", 1, 10, 7)
+    sentiment_score = st.select_slider("Sentimiento del producto (-1/0/1)", options=[-1,0,1], value=1)
 
-    # Calcular margen $ (aprox) desde margen_pct (si no tenemos costo real en simulación)
-    margen_unitario_est = float(precio) * (float(margen_pct) / 100.0)
+    base_conexion = (rating_conexion/10)*70 + sentiment_score*15 + 5
+    conexion_score = clip(base_conexion * (1 + uplift), 0, 100)
 
     entrada = pd.DataFrame([{
         "precio": float(precio),
@@ -315,171 +427,182 @@ with tab_sim:
         "conexion_score": float(conexion_score),
         "rating_conexion": float(rating_conexion),
         "sentiment_score": float(sentiment_score),
-        "marca": marca,
-        "canal": canal
+        "marca": str(marca).lower(),
+        "canal": str(canal).lower()
     }])
 
+    st.markdown("#### Scores calculados")
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Claims Score", f"{cscore:.1f}/100")
+    s2.metric("Emotion Pack Score", f"{pack_emotion:.1f}/100")
+    s3.metric("Conexión final (con uplift)", f"{conexion_score:.1f}/100")
+
     if st.button("🚀 Simular"):
-        proba = float(success_model.predict_proba(entrada)[0][1])
+        p = float(success_model.predict_proba(entrada)[0][1])
         pred = int(success_model.predict(entrada)[0])
 
-        # Predicción ventas (unidades)
-        ventas_pred = float(sales_model.predict(entrada)[0])
-        ventas_pred = max(0, round(ventas_pred))
-
-        ingresos_pred = ventas_pred * float(precio)
-        utilidad_pred = ventas_pred * margen_unitario_est
+        ventas = max(0, round(float(sales_model.predict(entrada)[0])))
+        ingresos = ventas * float(precio)
+        utilidad = ventas * (float(precio) * (float(margen_pct)/100.0))
 
         r1, r2, r3 = st.columns(3)
-        r1.metric("Probabilidad de éxito", f"{proba*100:.2f}%")
-        r2.metric("Predicción", "✅ Éxito" if pred == 1 else "⚠️ Riesgo")
-        r3.metric("Conexión emocional", f"{conexion_score:.1f} / 100")
+        r1.metric("Prob. éxito", safe_percent(p))
+        r2.metric("Predicción", "✅ Éxito" if pred else "⚠️ Riesgo")
+        r3.metric("Ventas (unidades)", f"{ventas:,.0f}")
 
-        v1, v2, v3 = st.columns(3)
-        v1.metric("Ventas estimadas (unidades)", f"{ventas_pred:,.0f}")
-        v2.metric("Ingresos estimados ($)", f"${ingresos_pred:,.0f}")
-        v3.metric("Utilidad estimada ($)", f"${utilidad_pred:,.0f}")
+        r4, r5 = st.columns(2)
+        r4.metric("Ingresos ($)", f"${ingresos:,.0f}")
+        r5.metric("Utilidad ($)", f"${utilidad:,.0f}")
 
-        st.caption(f"Sentimiento: {sentiment_score:+d}  |  Estacionalidad (informativa): {estacionalidad}")
-
-        st.markdown("#### Entrada usada por los modelos")
+        st.caption("Nota: las recomendaciones de empaque/claims ajustan la conexión emocional y esto impacta los modelos.")
         st.dataframe(entrada, use_container_width=True)
 
 # ============================================================
-# TAB: Insights
+# 📦 Pack Lab
 # ============================================================
-with tab_ins:
-    st.subheader("📊 Insights (Marca, Canal, Conexión, Éxito, Ventas)")
+with tab_pack:
+    st.subheader("📦 Pack Lab (sube tu empaque y te doy recomendaciones)")
+    st.write("Sube una imagen del empaque. Calculamos métricas visuales (sin OCR pesado) y devolvemos recomendaciones prácticas.")
 
-    left, right = st.columns(2)
+    img_file = st.file_uploader("Sube imagen del empaque (PNG/JPG)", type=["png","jpg","jpeg"])
+    if img_file is None:
+        st.info("Sube una imagen para generar análisis del empaque.")
+    else:
+        img = Image.open(img_file)
+        st.image(img, caption="Empaque cargado", use_container_width=True)
 
-    with left:
-        st.markdown("**Ranking por marca (Conexión promedio)**")
-        ins_marca = (
-            df.groupby("marca")[["conexion_score"]]
-            .mean()
-            .sort_values("conexion_score", ascending=False)
-            .round(2)
+        m = image_metrics(img)
+        scores = pack_scores_from_metrics(m)
+
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Brillo", f"{m['brightness']:.2f}")
+        a2.metric("Contraste", f"{m['contrast']:.2f}")
+        a3.metric("Colorfulness", f"{m['colorfulness']:.2f}")
+        a4.metric("Edge density", f"{m['edge_density']:.3f}")
+
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Legibilidad", f"{scores['pack_legibility_score']}/100")
+        b2.metric("Shelf Pop", f"{scores['pack_shelf_pop_score']}/100")
+        b3.metric("Claridad", f"{scores['pack_clarity_score']}/100")
+
+        st.markdown("### Recomendaciones rápidas")
+        recs = []
+        if scores["pack_legibility_score"] < 60:
+            recs.append("• Sube legibilidad: más contraste entre texto/fondo, tipografías más gruesas, menos elementos alrededor del claim principal.")
+        if scores["pack_clarity_score"] < 60:
+            recs.append("• Mejora claridad: reduce ruido visual (menos bloques/íconos), deja “aire”, y limita a 2–3 claims máximo.")
+        if scores["pack_shelf_pop_score"] < 60:
+            recs.append("• Sube shelf pop: usa un color acento, mejora contraste y evita que el pack quede demasiado oscuro o lavado.")
+        if m["edge_density"] > 0.28:
+            recs.append("• Hay saturación visual: demasiados bordes → parece “ruidoso”. Simplifica fondos, patrones y microtextos.")
+        if not recs:
+            recs.append("• Va bastante bien visualmente. Tu siguiente mejora está en jerarquía: Marca → beneficio → variedad/sabor → prueba/credencial.")
+
+        st.write("\n".join(recs))
+
+        st.markdown("### Cómo usar esto en tu simulador")
+        st.code(
+            f"Legibilidad={scores['pack_legibility_score']}, ShelfPop={scores['pack_shelf_pop_score']}, Claridad={scores['pack_clarity_score']}",
+            language="text"
         )
-        st.dataframe(ins_marca, use_container_width=True)
-
-        st.markdown("**Ranking por marca (Éxito %)**")
-        ex_marca = (
-            df.groupby("marca")[["exito"]]
-            .mean()
-            .sort_values("exito", ascending=False)
-            .round(3)
-        )
-        ex_marca["exito_%"] = (ex_marca["exito"] * 100).round(1)
-        st.dataframe(ex_marca[["exito_%"]], use_container_width=True)
-
-        st.markdown("**Ranking por marca (Ventas unidades promedio)**")
-        v_marca = (
-            df.groupby("marca")[["ventas_unidades"]]
-            .mean()
-            .sort_values("ventas_unidades", ascending=False)
-            .round(0)
-        )
-        st.dataframe(v_marca, use_container_width=True)
-
-    with right:
-        st.markdown("**Marca + Canal (Conexión promedio)**")
-        ins_mc = (
-            df.groupby(["marca", "canal"])[["conexion_score"]]
-            .mean()
-            .sort_values("conexion_score", ascending=False)
-            .round(2)
-        )
-        st.dataframe(ins_mc.head(20), use_container_width=True)
-
-        st.markdown("**Marca + Canal (Éxito %)**")
-        ex_mc = (
-            df.groupby(["marca", "canal"])[["exito"]]
-            .mean()
-            .sort_values("exito", ascending=False)
-            .round(3)
-        )
-        ex_mc["exito_%"] = (ex_mc["exito"] * 100).round(1)
-        st.dataframe(ex_mc.head(20)[["exito_%"]], use_container_width=True)
-
-        st.markdown("**Marca + Canal (Ventas unidades promedio)**")
-        v_mc = (
-            df.groupby(["marca", "canal"])[["ventas_unidades"]]
-            .mean()
-            .sort_values("ventas_unidades", ascending=False)
-            .round(0)
-        )
-        st.dataframe(v_mc.head(20), use_container_width=True)
-
-    st.divider()
-    st.markdown("### Distribuciones")
-    d1, d2 = st.columns(2)
-    with d1:
-        st.markdown("**Histograma: Conexión emocional**")
-        st.bar_chart(df["conexion_score"].value_counts().sort_index())
-    with d2:
-        st.markdown("**Histograma: Ventas (unidades)**")
-        st.bar_chart(df["ventas_unidades"].clip(0, 20000).round(-1).value_counts().sort_index().head(120))
 
 # ============================================================
-# TAB: Datos
+# 🏷️ Claims Lab
 # ============================================================
-with tab_data:
-    st.subheader("📂 Explorador del dataset + Descarga CSV")
+with tab_claims:
+    st.subheader("🏷️ Claims Lab (recomendación de claims ganadores)")
+    st.write("Elige segmento + canal y te recomiendo claims; luego puedes simular su impacto (via conexión).")
 
-    # Botón de descarga
-    st.download_button(
-        label="📥 Descargar dataset completo (CSV)",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name="mercado_cereales_5000_con_ventas.csv",
-        mime="text/csv"
+    c1, c2 = st.columns(2)
+    segmento = c1.selectbox("Segmento", ["fit", "kids", "premium", "value"], 0)
+    canal = c2.selectbox("Canal", ["retail","marketplace"], 0)
+
+    recs = recommend_claims(segmento, canal, max_claims=8)
+    st.markdown("### Top claims recomendados")
+    rec_df = pd.DataFrame(recs, columns=["claim", "score_base"])
+    rec_df["score_base"] = (rec_df["score_base"]*100).round(1)
+    st.dataframe(rec_df, use_container_width=True)
+
+    selected = st.multiselect("Selecciona 2-3 claims para tu pack", rec_df["claim"].tolist(), default=rec_df["claim"].tolist()[:2])
+    cscore = claims_score(selected, canal)
+    st.metric("Claims Score (claridad + canal fit)", f"{cscore:.1f}/100")
+
+    st.markdown("### Reglas prácticas")
+    st.write(
+        "- Ideal: **2–3 claims máximo** (claridad)\n"
+        "- 1 claim funcional (ej. fibra/proteína) + 1 claim limpio (ej. sin azúcar añadida)\n"
+        "- Marketplace tolera más detalle, retail exige más simplicidad\n"
     )
 
-    f1, f2, f3 = st.columns(3)
-    fmarca = f1.multiselect("Filtrar marca", sorted(df["marca"].unique().tolist()), default=[])
-    fcanal = f2.multiselect("Filtrar canal", sorted(df["canal"].unique().tolist()), default=[])
-    fex = f3.selectbox("Filtrar éxito", ["Todos", "Éxito (1)", "No éxito (0)"], index=0)
-
-    dff = df.copy()
-    if fmarca:
-        dff = dff[dff["marca"].isin(fmarca)]
-    if fcanal:
-        dff = dff[dff["canal"].isin(fcanal)]
-    if fex == "Éxito (1)":
-        dff = dff[dff["exito"] == 1]
-    elif fex == "No éxito (0)":
-        dff = dff[dff["exito"] == 0]
-
-    st.dataframe(dff.head(500), use_container_width=True)
-    st.caption(f"Mostrando {min(len(dff), 500)} de {len(dff)} registros filtrados.")
+    st.warning("Nota: Los claims deben validarse con normativa/etiquetado aplicable. Esto es recomendación comercial, no legal.")
 
 # ============================================================
-# TAB: Modelo
+# 🧪 Experimentos (A/B simple en memoria)
+# ============================================================
+with tab_exp:
+    st.subheader("🧪 Experimentos (A/B) — aprende qué pack/claim gana")
+    st.write("Aquí registras resultados rápidos (por ahora en memoria). Después lo conectamos a SQL para histórico real.")
+
+    if "experiments" not in st.session_state:
+        st.session_state.experiments = []
+
+    c1, c2, c3 = st.columns(3)
+    exp_name = c1.text_input("Nombre experimento", value="Test Pack v1 vs v2")
+    variant = c2.selectbox("Variante", ["A", "B"], 0)
+    metric = c3.selectbox("Métrica", ["intencion_compra", "conexion_pack", "ventas_piloto"], 0)
+
+    v1, v2, v3 = st.columns(3)
+    marca = v1.selectbox("Marca", sorted(df["marca"].unique().tolist()), 0)
+    canal = v2.selectbox("Canal", sorted(df["canal"].unique().tolist()), 0)
+    value = v3.number_input("Valor observado", value=7.0, step=0.1)
+
+    if st.button("➕ Guardar medición"):
+        st.session_state.experiments.append({
+            "experimento": exp_name,
+            "variante": variant,
+            "marca": marca,
+            "canal": canal,
+            "metrica": metric,
+            "valor": float(value)
+        })
+        st.success("Guardado.")
+
+    if st.session_state.experiments:
+        exp_df = pd.DataFrame(st.session_state.experiments)
+        st.dataframe(exp_df, use_container_width=True)
+
+        st.markdown("### Resumen rápido")
+        try:
+            pivot = exp_df.pivot_table(index=["experimento","metrica"], columns="variante", values="valor", aggfunc="mean")
+            pivot["lift_B_vs_A"] = (pivot.get("B") - pivot.get("A"))
+            st.dataframe(pivot.round(3), use_container_width=True)
+        except Exception:
+            st.info("Necesitas registros en A y B para calcular lift.")
+
+        st.caption("Siguiente paso: guardar esto en SQL y entrenar un modelo que aprenda automáticamente el mejor claim/pack.")
+    else:
+        st.info("Aún no hay experimentos guardados.")
+
+# ============================================================
+# 📂 Datos
+# ============================================================
+with tab_data:
+    st.subheader("📂 Datos + Descarga")
+    st.download_button(
+        label="📥 Descargar dataset (CSV)",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="dataset_con_ventas.csv",
+        mime="text/csv"
+    )
+    st.dataframe(df.head(300), use_container_width=True)
+
+# ============================================================
+# 🧠 Modelo
 # ============================================================
 with tab_model:
-    st.subheader("🧠 Diagnóstico del modelo")
+    st.subheader("🧠 Diagnóstico")
+    st.markdown("**Matriz de confusión (éxito)**")
+    st.dataframe(pd.DataFrame(cm, index=["Real 0","Real 1"], columns=["Pred 0","Pred 1"]), use_container_width=True)
 
-    st.markdown("**Matriz de confusión (test) — Éxito**")
-    cm_df = pd.DataFrame(cm, index=["Real 0", "Real 1"], columns=["Pred 0", "Pred 1"])
-    st.dataframe(cm_df, use_container_width=True)
-
-    st.markdown("**Importancias de features (aprox.) — Modelo Éxito**")
-    try:
-        rf = success_model.named_steps["model"]
-        pre = success_model.named_steps["preprocessor"]
-
-        ohe = pre.named_transformers_["cat"]
-        cat_features = ohe.get_feature_names_out(["marca", "canal"]).tolist()
-
-        feature_names = [
-            "precio","competencia","demanda","tendencia","margen_pct",
-            "conexion_score","rating_conexion","sentiment_score"
-        ] + cat_features
-
-        importances = pd.Series(rf.feature_importances_, index=feature_names).sort_values(ascending=False)
-        st.dataframe(importances.head(30).round(4), use_container_width=True)
-    except Exception:
-        st.info("No se pudieron mostrar importancias (depende de versión de scikit-learn).")
-
-    st.markdown("**MAE — Modelo Ventas**")
-    st.write(f"Error absoluto medio (MAE): **{mae:,.0f} unidades** (mientras más bajo, mejor)")
+    st.markdown("**MAE ventas**")
+    st.write(f"Error absoluto medio: **{mae:,.0f}** unidades (mientras menor, mejor).")
