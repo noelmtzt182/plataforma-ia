@@ -1,8 +1,0 @@
-streamlit
-pandas
-numpy
-pillow
-matplotlib
-scikit-learn
-imageio
-imageio-ffmpeg
