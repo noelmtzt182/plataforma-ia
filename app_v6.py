@@ -12,7 +12,6 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 import requests
-import cv2
 
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
